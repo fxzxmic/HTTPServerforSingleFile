@@ -10,9 +10,9 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 
-#include <fstream>
 #include <windows.h>
 #include <http.h>
+#include <wchar.h>
 
 #pragma comment(lib, "httpapi.lib")
 
@@ -43,20 +43,19 @@
 // Prototypes.
 //
 
-PSTR GetFile(
-	IN PCWSTR Path);
+PSTR ReadSingleFile(
+	IN PCWSTR lpFileName);
 
-DWORD DoReceiveRequests(
-	HANDLE hReqQueue,
-	PSTR File);
+DWORD ReceiveRequests(
+	IN HANDLE hReqQueue,
+	IN PSTR pBuffer);
 
-DWORD
-SendHttpResponse(
+DWORD SendResponse(
 	IN HANDLE hReqQueue,
 	IN PHTTP_REQUEST pRequest,
 	IN USHORT StatusCode,
 	IN PSTR pReason,
-	IN PSTR pEntity);
+	IN PSTR pEntityString);
 
 /*******************************************************************++
 
@@ -73,7 +72,7 @@ Return Value:
 --*******************************************************************/
 int __cdecl wmain(
 	int argc,
-	wchar_t *argv[])
+	wchar_t* argv[])
 {
 	ULONG retCode;
 	HANDLE hReqQueue = NULL;
@@ -136,7 +135,7 @@ int __cdecl wmain(
 		goto CleanUp;
 	}
 
-	DoReceiveRequests(hReqQueue, GetFile(argv[2]));
+	ReceiveRequests(hReqQueue, ReadSingleFile(argv[2]));
 
 CleanUp:
 
@@ -164,37 +163,55 @@ CleanUp:
 	return retCode;
 }
 
-PSTR GetFile(
-	IN PCWSTR Path)
+PSTR ReadSingleFile(
+	IN PCWSTR lpFileName)
 {
-	std::ifstream pFile;
+	DWORD dwBytesRead;
 
 	//
-	// Open file as binary
+	// Open the existing file.
 	//
-	pFile.open(Path, std::ios::binary);
-	if (!pFile.is_open())
+	HANDLE hFile = CreateFileW(lpFileName,        // file to open
+						GENERIC_READ,             // open for reading
+						0,                        // do not share
+						NULL,                     // default security
+						OPEN_EXISTING,            // existing file only
+						FILE_ATTRIBUTE_NORMAL,    // normal file
+						NULL);                    // no attr. template
+
+	if (hFile == INVALID_HANDLE_VALUE)
 	{
-		wprintf(L"Failed to read file : %s\n", Path);
-		return (PSTR) "Read File Failed!";
+		wprintf(L"Could not open file : %s\n", lpFileName);
+		return NULL;
 	}
 
 	//
-	// Calculate file length
+	// Read data from the file.
 	//
-	pFile.seekg(0, std::ios::end);
-	size_t length = static_cast<size_t>(pFile.tellg());
-	pFile.seekg(0, std::ios::beg);
+	DWORD dwFileSize = GetFileSize(hFile, NULL);
+	PSTR pBuffer = new char[dwFileSize + 1];
+
+	if (!ReadFile(hFile, pBuffer, dwFileSize, &dwBytesRead, NULL))
+	{
+		wprintf(L"Could not read file : %s\n", lpFileName);
+		CloseHandle(hFile);
+
+		FREE_MEM(pBuffer);
+
+		return NULL;
+	}
 
 	//
-	// Read the file
+	// Null-terminate the buffer.
 	//
-	CHAR *pFileBuffer = new char[length + 1];
-	pFile.read(pFileBuffer, length);
-	pFileBuffer[length] = NULL;
-	pFile.close();
+	pBuffer[dwFileSize] = NULL;
 
-	return pFileBuffer;
+	//
+	// Close the file.
+	//
+	CloseHandle(hFile);
+
+	return pBuffer;
 }
 
 /*******************************************************************++
@@ -211,9 +228,9 @@ Success/Failure.
 
 --*******************************************************************/
 
-DWORD DoReceiveRequests(
+DWORD ReceiveRequests(
 	IN HANDLE hReqQueue,
-	IN PSTR File)
+	IN PSTR pBuffer)
 {
 	ULONG result;
 	HTTP_REQUEST_ID requestId;
@@ -232,6 +249,7 @@ DWORD DoReceiveRequests(
 
 	if (pRequestBuffer == NULL)
 	{
+		wprintf(L"Failed to allocate memory\n");
 		return ERROR_NOT_ENOUGH_MEMORY;
 	}
 
@@ -265,29 +283,29 @@ DWORD DoReceiveRequests(
 			//
 			switch (pRequest->Verb)
 			{
-			case HttpVerbGET:
-				wprintf(L"Got a GET request for %ws \n",
-						pRequest->CookedUrl.pFullUrl);
+				case HttpVerbGET:
+					wprintf(L"Got a GET request for %ws \n",
+							pRequest->CookedUrl.pFullUrl);
 
-				result = SendHttpResponse(
-					hReqQueue,
-					pRequest,
-					200,
-					(PSTR) "OK",
-					(PSTR)File);
-				break;
+					result = SendResponse(
+						hReqQueue,
+						pRequest,
+						200,
+						"OK",
+						pBuffer);
+					break;
 
-			default:
-				wprintf(L"Got a unknown request for %ws \n",
-						pRequest->CookedUrl.pFullUrl);
+				default:
+					wprintf(L"Got a unknown request for %ws \n",
+							pRequest->CookedUrl.pFullUrl);
 
-				result = SendHttpResponse(
-					hReqQueue,
-					pRequest,
-					503,
-					(PSTR) "Not Implemented",
-					NULL);
-				break;
+					result = SendResponse(
+						hReqQueue,
+						pRequest,
+						503,
+						"Not Implemented",
+						NULL);
+					break;
 			}
 
 			if (result != NO_ERROR)
@@ -299,8 +317,7 @@ DWORD DoReceiveRequests(
 			// Reset the Request ID to handle the next request.
 			//
 			HTTP_SET_NULL_ID(&requestId);
-		}
-		else if (result == ERROR_MORE_DATA)
+		} else if (result == ERROR_MORE_DATA)
 		{
 			//
 			// The input buffer was too small to hold the request
@@ -323,24 +340,28 @@ DWORD DoReceiveRequests(
 
 			if (pRequestBuffer == NULL)
 			{
+				wprintf(L"Failed to allocate memory\n");
 				result = ERROR_NOT_ENOUGH_MEMORY;
 				break;
 			}
 
 			pRequest = (PHTTP_REQUEST)pRequestBuffer;
-		}
-		else if (ERROR_CONNECTION_INVALID == result && !HTTP_IS_NULL_ID(&requestId))
+		} else if (ERROR_CONNECTION_INVALID == result && !HTTP_IS_NULL_ID(&requestId))
 		{
 			// The TCP connection was corrupted by the peer when
 			// attempting to handle a request with more buffer.
 			// Continue to the next request.
 
 			HTTP_SET_NULL_ID(&requestId);
-		}
-		else
+		} else
 		{
 			break;
 		}
+	}
+
+	if (pBuffer)
+	{
+		FREE_MEM(pBuffer);
 	}
 
 	if (pRequestBuffer)
@@ -367,7 +388,7 @@ Return Value:
 Success/Failure.
 --*******************************************************************/
 
-DWORD SendHttpResponse(
+DWORD SendResponse(
 	IN HANDLE hReqQueue,
 	IN PHTTP_REQUEST pRequest,
 	IN USHORT StatusCode,
@@ -390,7 +411,7 @@ DWORD SendHttpResponse(
 	ADD_KNOWN_HEADER(response, HttpHeaderServer, "HTTPServer");
 	ADD_KNOWN_HEADER(response, HttpHeaderAcceptCharset, "UTF-8");
 	ADD_KNOWN_HEADER(response, HttpHeaderAcceptRanges, "bytes");
-	ADD_KNOWN_HEADER(response, HttpHeaderConnection, "keep-alive");
+	ADD_KNOWN_HEADER(response, HttpHeaderConnection, "close");
 	ADD_KNOWN_HEADER(response, HttpHeaderContentType, "text/html");
 
 	if (pEntityString)
@@ -413,16 +434,16 @@ DWORD SendHttpResponse(
 	//
 
 	result = HttpSendHttpResponse(
-		hReqQueue,			 // ReqQueueHandle
-		pRequest->RequestId, // Request ID
-		0,					 // Flags
-		&response,			 // HTTP response
-		NULL,				 // pReserved1
-		&bytesSent,			 // bytes sent  (OPTIONAL)
-		NULL,				 // pReserved2  (must be NULL)
-		0,					 // Reserved3   (must be 0)
-		NULL,				 // LPOVERLAPPED(OPTIONAL)
-		NULL				 // pReserved4  (must be NULL)
+		hReqQueue,			 				// ReqQueueHandle
+		pRequest->RequestId, 				// Request ID
+		HTTP_SEND_RESPONSE_FLAG_DISCONNECT,	// Flags
+		&response,			 				// HTTP response
+		NULL,				 				// pReserved1
+		&bytesSent,			 				// bytes sent  (OPTIONAL)
+		NULL,				 				// pReserved2  (must be NULL)
+		0,					 				// Reserved3   (must be 0)
+		NULL,				 				// LPOVERLAPPED(OPTIONAL)
+		NULL				 				// pReserved4  (must be NULL)
 	);
 
 	if (result != NO_ERROR)
